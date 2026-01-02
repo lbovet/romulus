@@ -4,6 +4,7 @@
 @prefix midi:  <http://lv2plug.in/ns/ext/midi#> .
 @prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix state: <http://lv2plug.in/ns/ext/state#> .
 @prefix urid:  <http://lv2plug.in/ns/ext/urid#> .
 @prefix time:  <http://lv2plug.in/ns/ext/time#> .
 
@@ -14,7 +15,9 @@
     doap:license <https://opensource.org/licenses/ISC> ;
     lv2:project <http://github.com/lbovet/romulus> ;
     lv2:requiredFeature urid:map ;
-    lv2:optionalFeature lv2:hardRTCapable ;
+    lv2:optionalFeature lv2:hardRTCapable ,
+    	state:threadSafeRestore ;
+	lv2:extensionData state:interface ;
     lv2:port [
         a lv2:InputPort ,
             atom:AtomPort ;
@@ -69,9 +72,19 @@
             rdf:value 16.0
         ]
     ] , [
-        a lv2:OutputPort ,
+        a lv2:InputPort ,
             lv2:ControlPort ;
         lv2:index 4 ;
+        lv2:symbol "persist_loop" ;
+        lv2:name "Persist Loop" ;
+        lv2:default 1.0 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0 ;
+        lv2:portProperty lv2:toggled
+    ] , [
+        a lv2:OutputPort ,
+            lv2:ControlPort ;
+        lv2:index 5 ;
         lv2:symbol "armed" ;
         lv2:name "Armed" ;
         lv2:default 0.0 ;
@@ -81,7 +94,7 @@
     ] , [
         a lv2:OutputPort ,
             lv2:ControlPort ;
-        lv2:index 5 ;
+        lv2:index 6 ;
         lv2:symbol "recording" ;
         lv2:name "Recording" ;
         lv2:default 0.0 ;
@@ -91,7 +104,7 @@
     ] , [
         a lv2:OutputPort ,
             lv2:ControlPort ;
-        lv2:index 6 ;
+        lv2:index 7 ;
         lv2:symbol "recorded" ;
         lv2:name "Recorded" ;
         lv2:default 0.0 ;

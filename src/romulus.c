@@ -9,6 +9,7 @@
 #include "lv2/lv2plug.in/ns/ext/atom/atom.h"
 #include "lv2/lv2plug.in/ns/ext/atom/util.h"
 #include "lv2/lv2plug.in/ns/ext/midi/midi.h"
+#include "lv2/lv2plug.in/ns/ext/state/state.h"
 #include "lv2/lv2plug.in/ns/ext/time/time.h"
 #include "lv2/lv2plug.in/ns/ext/urid/urid.h"
 
@@ -25,9 +26,10 @@ typedef enum {
     PORT_MIDI_OUT = 1,
     PORT_RECORD_ENABLE = 2,
     PORT_LOOP_LENGTH = 3,
-    PORT_ARMED = 4,
-    PORT_RECORDING = 5,
-    PORT_RECORDED = 6
+    PORT_PERSIST_LOOP = 4,
+    PORT_ARMED = 5,
+    PORT_RECORDING = 6,
+    PORT_RECORDED = 7,
 } PortIndex;
 
 /* Plugin state */
@@ -81,6 +83,7 @@ typedef struct {
     float* armed;
     float* recording;
     float* recorded;
+    const float* persist_loop;
     
     /* URIDs */
     URIDs urids;
@@ -199,6 +202,9 @@ connect_port(LV2_Handle instance, uint32_t port, void* data)
     case PORT_LOOP_LENGTH:
         self->loop_length = (const float*)data;
         break;
+    case PORT_PERSIST_LOOP:
+        self->persist_loop = (const float*)data;
+        break;        
     case PORT_ARMED:
         self->armed = (float*)data;
         break;
@@ -378,6 +384,16 @@ update_transport(Romulus* self, const LV2_Atom_Object* obj)
         /* Detect transport stop */
         if (was_rolling && !self->transport_rolling) {
             self->transport_just_stopped = true;
+        }
+        
+        /* Detect transport start - if we have a recorded loop, start playing */
+        if (!was_rolling && self->transport_rolling) {
+            if (self->state == STATE_IDLE && self->event_count > 0) {
+                fprintf(stderr, "Romulus: Transport started, IDLE -> PLAYING (auto-start with %u events)\n", 
+                       self->event_count);
+                self->state = STATE_PLAYING;
+                self->current_loop_frame = 0;
+            }
         }
     }
 }
@@ -613,10 +629,138 @@ cleanup(LV2_Handle instance)
     free(instance);
 }
 
+/* Save state */
+static LV2_State_Status
+save(LV2_Handle                instance,
+     LV2_State_Store_Function  store,
+     LV2_State_Handle          handle,
+     uint32_t                  flags,
+     const LV2_Feature* const* features)
+{
+    Romulus* self = (Romulus*)instance;
+    
+    fprintf(stderr, "Romulus: Saving requested\n");
+
+    /* Only save if persist_loop is enabled */
+    if (*self->persist_loop < 0.5f) {
+        fprintf(stderr, "Romulus: Not saving state because persist_loop is disabled\n");
+        return LV2_STATE_SUCCESS;
+    }
+    
+    (void)features;  /* Unused */
+
+    LV2_URID event_count_urid = self->map->map(self->map->handle, PLUGIN_URI "#event_count");
+    LV2_URID loop_length_frames_urid = self->map->map(self->map->handle, PLUGIN_URI "#loop_length_frames");
+    LV2_URID events_urid = self->map->map(self->map->handle, PLUGIN_URI "#events");
+    
+    /* Save event count */
+    store(handle, event_count_urid,
+          &self->event_count, sizeof(uint32_t),
+          self->urids.atom_Long,
+          LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE);
+    
+    /* Save loop length */
+    store(handle, loop_length_frames_urid,
+          &self->loop_length_frames, sizeof(uint32_t),
+          self->urids.atom_Long,
+          LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE);
+    
+    /* Save events array */
+    if (self->event_count > 0) {
+        fprintf(stderr, "Romulus: Saving %u events, size=%lu bytes\n",
+               self->event_count, sizeof(MidiEvent) * self->event_count);
+        store(handle, events_urid,
+              self->events, sizeof(MidiEvent) * self->event_count,
+              self->urids.atom_Long,  /* Use Long for binary data blob */
+              LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE);
+    }
+    
+    return LV2_STATE_SUCCESS;
+}
+
+/* Restore state */
+static LV2_State_Status
+restore(LV2_Handle                  instance,
+        LV2_State_Retrieve_Function retrieve,
+        LV2_State_Handle            handle,
+        uint32_t                    flags,
+        const LV2_Feature* const*   features)
+{
+    Romulus* self = (Romulus*)instance;
+    
+    (void)features;  /* Unused */
+    
+    fprintf(stderr, "Romulus: Restore requested\n");
+
+    LV2_URID event_count_urid = self->map->map(self->map->handle, PLUGIN_URI "#event_count");
+    LV2_URID loop_length_frames_urid = self->map->map(self->map->handle, PLUGIN_URI "#loop_length_frames");
+    LV2_URID events_urid = self->map->map(self->map->handle, PLUGIN_URI "#events");
+    
+    fprintf(stderr, "Romulus: URIDs - event_count=%u, loop_length=%u, events=%u\n",
+           event_count_urid, loop_length_frames_urid, events_urid);
+    
+    /* Restore event count */
+    size_t size;
+    uint32_t type;
+    uint32_t valflags;
+    
+    const void* value = retrieve(handle, event_count_urid, &size, &type, &valflags);
+    if (value) {
+        self->event_count = *(const uint32_t*)value;
+        fprintf(stderr, "Romulus: Restored event_count=%u (size=%lu, type=%u)\n", 
+               self->event_count, size, type);
+    } else {
+        fprintf(stderr, "Romulus: No event_count in state\n");
+    }
+    
+    /* Restore loop length */
+    value = retrieve(handle, loop_length_frames_urid, &size, &type, &valflags);
+    if (value) {
+        self->loop_length_frames = *(const uint32_t*)value;
+        fprintf(stderr, "Romulus: Restored loop_length_frames=%u (size=%lu, type=%u)\n", 
+               self->loop_length_frames, size, type);
+    } else {
+        fprintf(stderr, "Romulus: No loop_length_frames in state\n");
+    }
+    
+    /* Restore events */
+    value = retrieve(handle, events_urid, &size, &type, &valflags);
+    if (value && self->event_count > 0) {
+        fprintf(stderr, "Romulus: Restoring events, size=%lu bytes, type=%u\n", size, type);
+        size_t copy_size = size;
+        if (copy_size > sizeof(MidiEvent) * MAX_MIDI_EVENTS) {
+            copy_size = sizeof(MidiEvent) * MAX_MIDI_EVENTS;
+            fprintf(stderr, "Romulus: WARNING - truncating events to fit MAX_MIDI_EVENTS\n");
+        }
+        memcpy(self->events, value, copy_size);
+        
+        /* If we restored events, transition to IDLE so transport start can trigger playback */
+        if (self->event_count > 0) {
+            self->state = STATE_IDLE;
+            fprintf(stderr, "Romulus: Restored %u events from state, transitioning to IDLE\n", self->event_count);
+        }
+    } else {
+        fprintf(stderr, "Romulus: No events in state (value=%p, event_count=%u)\n", 
+               value, self->event_count);
+    }
+    
+    fprintf(stderr, "Romulus: State restore complete\n");
+    return LV2_STATE_SUCCESS;
+}
+
+/* State interface */
+static const LV2_State_Interface state_interface = {
+    save,
+    restore
+};
+
 /* Extension data */
 static const void*
 extension_data(const char* uri)
 {
+    if (!strcmp(uri, LV2_STATE__interface)) {
+        return &state_interface;
+    }
     return NULL;
 }
 
