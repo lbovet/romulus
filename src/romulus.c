@@ -24,7 +24,10 @@ typedef enum {
     PORT_MIDI_IN = 0,
     PORT_MIDI_OUT = 1,
     PORT_RECORD_ENABLE = 2,
-    PORT_LOOP_LENGTH = 3
+    PORT_LOOP_LENGTH = 3,
+    PORT_ARMED = 4,
+    PORT_RECORDING = 5,
+    PORT_RECORDED = 6
 } PortIndex;
 
 /* Plugin state */
@@ -75,6 +78,9 @@ typedef struct {
     LV2_Atom_Sequence* midi_out;
     const float* record_enable;
     const float* loop_length;
+    float* armed;
+    float* recording;
+    float* recorded;
     
     /* URIDs */
     URIDs urids;
@@ -192,6 +198,15 @@ connect_port(LV2_Handle instance, uint32_t port, void* data)
         break;
     case PORT_LOOP_LENGTH:
         self->loop_length = (const float*)data;
+        break;
+    case PORT_ARMED:
+        self->armed = (float*)data;
+        break;
+    case PORT_RECORDING:
+        self->recording = (float*)data;
+        break;
+    case PORT_RECORDED:
+        self->recorded = (float*)data;
         break;
     }
 }
@@ -577,6 +592,11 @@ run(LV2_Handle instance, uint32_t n_samples)
             self->current_loop_frame = 0;
         }
     }
+    
+    /* Update status output ports */
+    *self->armed = (self->state == STATE_ARMED) ? 1.0f : 0.0f;
+    *self->recording = (self->state == STATE_RECORDING) ? 1.0f : 0.0f;
+    *self->recorded = (self->state == STATE_PLAYING) ? 1.0f : 0.0f;
 }
 
 /* Deactivate the plugin */
