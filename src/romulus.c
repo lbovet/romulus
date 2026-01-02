@@ -269,11 +269,6 @@ note_off(Romulus* self, uint8_t channel, uint8_t note)
 {
     int idx = get_note_index(channel, note);
     self->active_notes[idx].active = false;
-    
-    /* If we were waiting for this note-off, stop waiting */
-    if (self->active_notes[idx].waiting_noteoff) {
-        self->active_notes[idx].waiting_noteoff = false;
-    }
 }
 
 /* Start waiting for note-offs of currently active notes */
@@ -283,10 +278,13 @@ start_waiting_for_noteoffs(Romulus* self)
     int waiting_count = 0;
     for (int i = 0; i < MAX_ACTIVE_NOTES; ++i) {
         if (self->active_notes[i].active) {
+            fprintf(stderr, "Romulus: Waiting for note-off ch=%d note=%d\n",
+                   self->active_notes[i].channel, self->active_notes[i].note);
             self->active_notes[i].waiting_noteoff = true;
             waiting_count++;
         }
     }
+    fprintf(stderr, "Romulus: Waiting for %d note-offs total\n", waiting_count);
 }
 
 /* Send note-off for all note-on events in the loop */
@@ -472,8 +470,14 @@ run(LV2_Handle instance, uint32_t n_samples)
                 if (is_noteoff) {
                     int idx = get_note_index(channel, msg[1]);
                     if (self->active_notes[idx].waiting_noteoff) {
-                        /* Add the note-off to the loop */
-                        add_event(self, self->loop_length_frames - 1, msg, ev->body.size);
+                        /* Calculate the position in the loop where this note-off occurred */
+                        uint32_t noteoff_frame = (self->current_loop_frame + ev->time.frames) % self->loop_length_frames;
+                        add_event(self, noteoff_frame, msg, ev->body.size);
+                        
+                        /* Stop waiting for this note-off */
+                        fprintf(stderr, "Romulus: Received awaited note-off ch=%d note=%d\n",
+                               channel, msg[1]);
+                        self->active_notes[idx].waiting_noteoff = false;
                     }
                 }
             }
@@ -539,11 +543,6 @@ run(LV2_Handle instance, uint32_t n_samples)
         }
         self->loop_start_frame += n_samples;
     } else if (self->state == STATE_PLAYING && self->transport_rolling) {
-        /* Play back loop aligned to bars */
-        if (is_bar_start(self)) {
-            self->current_loop_frame = 0;
-        }
-        
         /* Output events that fall within this buffer */
         for (uint32_t i = 0; i < self->event_count; ++i) {
             MidiEvent* event = &self->events[i];
@@ -566,9 +565,13 @@ run(LV2_Handle instance, uint32_t n_samples)
                     
                     if (is_noteoff && self->active_notes[idx].waiting_noteoff) {
                         /* Mark this note-off event as ignored and skip it */
+                        fprintf(stderr, "Romulus: Ignoring note-off ch=%d note=%d (waiting for external note-off)\n",
+                               channel, msg[1]);
                         event->ignored = true;
                     } else if (is_noteon && self->active_notes[idx].waiting_noteoff) {
                         /* Note-on from loop while waiting - stop waiting for note-off */
+                        fprintf(stderr, "Romulus: Note-on ch=%d note=%d while waiting - stopping wait\n",
+                               channel, msg[1]);
                         self->active_notes[idx].waiting_noteoff = false;
                     }
                     
@@ -695,9 +698,6 @@ restore(LV2_Handle                  instance,
     LV2_URID event_count_urid = self->map->map(self->map->handle, PLUGIN_URI "#event_count");
     LV2_URID loop_length_frames_urid = self->map->map(self->map->handle, PLUGIN_URI "#loop_length_frames");
     LV2_URID events_urid = self->map->map(self->map->handle, PLUGIN_URI "#events");
-    
-    fprintf(stderr, "Romulus: URIDs - event_count=%u, loop_length=%u, events=%u\n",
-           event_count_urid, loop_length_frames_urid, events_urid);
     
     /* Restore event count */
     size_t size;
