@@ -382,16 +382,16 @@ update_transport(Romulus* self, const LV2_Atom_Object* obj)
         /* Detect transport stop */
         if (was_rolling && !self->transport_rolling) {
             self->transport_just_stopped = true;
+            /* If we were playing, go back to IDLE */
+            if (self->state == STATE_PLAYING) {
+                fprintf(stderr, "Romulus: Transport stopped, PLAYING -> IDLE\n");
+                self->state = STATE_IDLE;
+            }
         }
         
-        /* Detect transport start - if we have a recorded loop, start playing */
+        /* Detect transport start - schedule playing */
         if (!was_rolling && self->transport_rolling) {
-            if (self->state == STATE_IDLE && self->event_count > 0) {
-                fprintf(stderr, "Romulus: Transport started, IDLE -> PLAYING (auto-start with %u events)\n", 
-                       self->event_count);
-                self->state = STATE_PLAYING;
-                self->current_loop_frame = 0;
-            }
+            self->state = STATE_IDLE;
         }
     }
 }
@@ -512,7 +512,15 @@ run(LV2_Handle instance, uint32_t n_samples)
     }
     
     /* State machine */
-    if (self->state == STATE_ARMED && self->transport_rolling) {
+    if (self->state == STATE_IDLE && self->transport_rolling && self->event_count > 0) {
+        /* Check if we've reached a bar boundary */
+        if (is_bar_start(self)) {
+            fprintf(stderr, "Romulus: IDLE -> PLAYING at bar start (%u events)\n", 
+                   self->event_count);
+            self->state = STATE_PLAYING;
+            self->current_loop_frame = 0;
+        }
+    } else if (self->state == STATE_ARMED && self->transport_rolling) {
         /* Check if we've reached a bar boundary */
         if (is_bar_start(self)) {
             /* Start recording */
