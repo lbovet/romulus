@@ -90,6 +90,7 @@ typedef struct {
     double beats_per_bar;
     double current_bar;
     double current_beat;
+    double prev_beat;
     bool transport_rolling;
     bool transport_just_stopped;
     
@@ -155,9 +156,11 @@ instantiate(const LV2_Descriptor* descriptor,
     
     self->sample_rate = rate;
     self->state = STATE_IDLE;
-    self->prev_record_enable = 1.0f;
+    self->prev_record_enable = 0.0f;
     self->bpm = 120.0;
     self->beats_per_bar = 4.0;
+    self->current_beat = 0.0;
+    self->prev_beat = 0.0;
     self->transport_rolling = false;
     self->transport_just_stopped = false;
     self->event_count = 0;
@@ -340,6 +343,7 @@ update_transport(Romulus* self, const LV2_Atom_Object* obj)
     }
     
     if (barBeat && barBeat->type == self->urids.atom_Float) {
+        self->prev_beat = self->current_beat;
         self->current_beat = (double)((LV2_Atom_Float*)barBeat)->body;
     }
     
@@ -367,8 +371,15 @@ update_transport(Romulus* self, const LV2_Atom_Object* obj)
 static bool
 is_bar_start(Romulus* self)
 {
-    /* Consider it a bar start if we're very close to beat 0 */
-    return self->current_beat < 0.01;
+    /* Detect bar boundary crossing:
+     * - Current beat is close to 0 (within first quarter beat)
+     * - OR we crossed from high to low (wrapped around bar boundary)
+     */
+    bool at_bar_start = self->current_beat < 0.25;
+    bool crossed_boundary = (self->prev_beat > self->beats_per_bar - 0.5) && 
+                           (self->current_beat < 0.5);
+    
+    return at_bar_start || crossed_boundary;
 }
 
 /* Run the plugin */
