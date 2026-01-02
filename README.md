@@ -7,7 +7,6 @@ An LV2 MIDI looper plugin that records MIDI events in loops aligned to the host 
 - **Bar-aligned recording**: Recording starts and loops at bar boundaries
 - **Configurable loop length**: Set loop length from 1 to 32 bars
 - **Smart note handling**: Waits for note-offs of active notes at loop end
-- **Note-off cleanup**: Automatically removes orphaned note-offs in the loop
 - **Re-recording**: Discard current recording and restart by toggling record enable during recording
 
 ## Controls
@@ -76,4 +75,4 @@ ISC License
 
 ## Author
 
-Created for the Romulus project
+Laurent Bovet

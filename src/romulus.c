@@ -29,8 +29,7 @@ typedef enum {
     STATE_IDLE,           /* Not recording, not playing */
     STATE_ARMED,          /* Waiting for next bar to start recording */
     STATE_RECORDING,      /* Currently recording */
-    STATE_PLAYING,        /* Playing back the loop */
-    STATE_WAITING_NOTEOFF /* Waiting for note-offs after recording ended */
+    STATE_PLAYING         /* Playing back the loop */
 } PluginState;
 
 /* MIDI event structure */
@@ -38,6 +37,7 @@ typedef struct {
     uint32_t frame;       /* Frame offset within loop */
     uint32_t size;        /* Size of MIDI message */
     uint8_t msg[3];       /* MIDI message data */
+    bool ignored;         /* Skip this event during playback */
 } MidiEvent;
 
 /* Active note tracking */
@@ -97,7 +97,6 @@ typedef struct {
     
     /* Active notes tracking */
     ActiveNote active_notes[MAX_ACTIVE_NOTES];
-    uint32_t notes_waiting_count; /* Count of notes waiting for note-off */
     
 } Romulus;
 
@@ -151,7 +150,6 @@ instantiate(const LV2_Descriptor* descriptor,
     self->beats_per_bar = 4.0;
     self->transport_rolling = false;
     self->event_count = 0;
-    self->notes_waiting_count = 0;
     
     /* Initialize active notes */
     for (int i = 0; i < MAX_ACTIVE_NOTES; ++i) {
@@ -202,6 +200,7 @@ add_event(Romulus* self, uint32_t frame, const uint8_t* msg, uint32_t size)
     MidiEvent* event = &self->events[self->event_count++];
     event->frame = frame;
     event->size = size;
+    event->ignored = false;
     memcpy(event->msg, msg, size < 3 ? size : 3);
 }
 
@@ -227,14 +226,6 @@ note_on(Romulus* self, uint8_t channel, uint8_t note)
     self->active_notes[idx].active = true;
     self->active_notes[idx].channel = channel;
     self->active_notes[idx].note = note;
-    
-    /* If we were waiting for a note-off and got a note-on, stop waiting */
-    if (self->active_notes[idx].waiting_noteoff) {
-        self->active_notes[idx].waiting_noteoff = false;
-        if (self->notes_waiting_count > 0) {
-            self->notes_waiting_count--;
-        }
-    }
 }
 
 /* Mark a note as inactive */
@@ -247,49 +238,16 @@ note_off(Romulus* self, uint8_t channel, uint8_t note)
     /* If we were waiting for this note-off, stop waiting */
     if (self->active_notes[idx].waiting_noteoff) {
         self->active_notes[idx].waiting_noteoff = false;
-        if (self->notes_waiting_count > 0) {
-            self->notes_waiting_count--;
-        }
     }
-}
-
-/* Remove note-off events for a specific note from the loop */
-static void
-remove_noteoff_events(Romulus* self, uint8_t channel, uint8_t note)
-{
-    uint32_t write_idx = 0;
-    for (uint32_t i = 0; i < self->event_count; ++i) {
-        const uint8_t* msg = self->events[i].msg;
-        uint8_t status = msg[0] & 0xF0;
-        uint8_t event_channel = msg[0] & 0x0F;
-        
-        /* Keep event if it's not a note-off for this note/channel */
-        bool is_noteoff = (status == 0x80) || (status == 0x90 && msg[2] == 0);
-        bool matches = (event_channel == channel) && (msg[1] == note);
-        
-        if (!(is_noteoff && matches)) {
-            if (write_idx != i) {
-                self->events[write_idx] = self->events[i];
-            }
-            write_idx++;
-        }
-    }
-    self->event_count = write_idx;
 }
 
 /* Start waiting for note-offs of currently active notes */
 static void
 start_waiting_for_noteoffs(Romulus* self)
 {
-    self->notes_waiting_count = 0;
     for (int i = 0; i < MAX_ACTIVE_NOTES; ++i) {
         if (self->active_notes[i].active) {
             self->active_notes[i].waiting_noteoff = true;
-            self->notes_waiting_count++;
-            
-            /* Remove existing note-offs for this note from the loop */
-            remove_noteoff_events(self, self->active_notes[i].channel, 
-                                self->active_notes[i].note);
         }
     }
 }
@@ -394,7 +352,7 @@ run(LV2_Handle instance, uint32_t n_samples)
                 if (loop_frame < self->loop_length_frames) {
                     add_event(self, loop_frame, msg, ev->body.size);
                 }
-            } else if (self->state == STATE_WAITING_NOTEOFF) {
+            } else if (self->state == STATE_PLAYING) {
                 /* Record note-off if we're waiting for it */
                 bool is_noteoff = (status == 0x80) || (status == 0x90 && msg[2] == 0);
                 if (is_noteoff) {
@@ -404,9 +362,6 @@ run(LV2_Handle instance, uint32_t n_samples)
                         add_event(self, self->loop_length_frames - 1, msg, ev->body.size);
                     }
                 }
-            } else if (self->state != STATE_ARMED && self->state != STATE_PLAYING) {
-                /* Pass through when idle */
-                lv2_atom_sequence_append_event(self->midi_out, out_capacity, ev);
             }
         } else if (ev->body.type == self->urids.time_Position) {
             /* Update transport information */
@@ -423,7 +378,6 @@ run(LV2_Handle instance, uint32_t n_samples)
                 self->active_notes[i].active = false;
                 self->active_notes[i].waiting_noteoff = false;
             }
-            self->notes_waiting_count = 0;
             self->state = STATE_ARMED;
         } else {
             self->state = STATE_ARMED;
@@ -446,31 +400,17 @@ run(LV2_Handle instance, uint32_t n_samples)
                 self->active_notes[i].active = false;
                 self->active_notes[i].waiting_noteoff = false;
             }
-            self->notes_waiting_count = 0;
         }
     } else if (self->state == STATE_RECORDING) {
         /* Check if loop length is reached */
         /* Note: This is simplified - a real implementation would track exact frame counts */
         if (self->loop_start_frame >= self->loop_length_frames) {
-            /* Recording complete */
+            /* Recording complete - start playback immediately */
             start_waiting_for_noteoffs(self);
-            
-            if (self->notes_waiting_count == 0) {
-                /* No notes waiting, start playback immediately */
-                self->state = STATE_PLAYING;
-                self->current_loop_frame = 0;
-            } else {
-                /* Wait for note-offs */
-                self->state = STATE_WAITING_NOTEOFF;
-            }
-        }
-        self->loop_start_frame += n_samples;
-    } else if (self->state == STATE_WAITING_NOTEOFF) {
-        /* Check if all note-offs received */
-        if (self->notes_waiting_count == 0) {
             self->state = STATE_PLAYING;
             self->current_loop_frame = 0;
         }
+        self->loop_start_frame += n_samples;
     } else if (self->state == STATE_PLAYING && self->transport_rolling) {
         /* Play back loop aligned to bars */
         if (is_bar_start(self)) {
@@ -487,16 +427,36 @@ run(LV2_Handle instance, uint32_t n_samples)
                 
                 uint32_t offset = global_frame - self->current_loop_frame;
                 if (offset < n_samples) {
-                    LV2_Atom_Event ev;
-                    ev.time.frames = offset;
-                    ev.body.type = self->urids.midi_MidiEvent;
-                    ev.body.size = event->size;
+                    /* Check event type */
+                    const uint8_t* msg = event->msg;
+                    uint8_t status = msg[0] & 0xF0;
+                    uint8_t channel = msg[0] & 0x0F;
+                    bool is_noteoff = (status == 0x80) || (status == 0x90 && msg[2] == 0);
+                    bool is_noteon = (status == 0x90 && msg[2] > 0);
                     
-                    lv2_atom_sequence_append_event(self->midi_out, out_capacity, &ev);
-                    /* Copy MIDI data */
-                    uint8_t* out_msg = (uint8_t*)LV2_ATOM_BODY(&self->midi_out->atom) + 
-                                      self->midi_out->atom.size - event->size;
-                    memcpy(out_msg, event->msg, event->size);
+                    int idx = get_note_index(channel, msg[1]);
+                    
+                    if (is_noteoff && self->active_notes[idx].waiting_noteoff) {
+                        /* Mark this note-off event as ignored and skip it */
+                        event->ignored = true;
+                    } else if (is_noteon && self->active_notes[idx].waiting_noteoff) {
+                        /* Note-on from loop while waiting - stop waiting for note-off */
+                        self->active_notes[idx].waiting_noteoff = false;
+                    }
+                    
+                    /* Skip ignored events */
+                    if (!event->ignored) {
+                        LV2_Atom_Event ev;
+                        ev.time.frames = offset;
+                        ev.body.type = self->urids.midi_MidiEvent;
+                        ev.body.size = event->size;
+                        
+                        lv2_atom_sequence_append_event(self->midi_out, out_capacity, &ev);
+                        /* Copy MIDI data */
+                        uint8_t* out_msg = (uint8_t*)LV2_ATOM_BODY(&self->midi_out->atom) + 
+                                          self->midi_out->atom.size - event->size;
+                        memcpy(out_msg, event->msg, event->size);
+                    }
                 }
             }
         }
