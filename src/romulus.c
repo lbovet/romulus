@@ -91,6 +91,7 @@ typedef struct {
     double current_bar;
     double current_beat;
     bool transport_rolling;
+    bool transport_just_stopped;
     
     /* Loop info */
     uint32_t loop_start_frame;  /* Absolute frame when loop recording started */
@@ -158,6 +159,7 @@ instantiate(const LV2_Descriptor* descriptor,
     self->bpm = 120.0;
     self->beats_per_bar = 4.0;
     self->transport_rolling = false;
+    self->transport_just_stopped = false;
     self->event_count = 0;
     
     /* Initialize active notes */
@@ -263,6 +265,51 @@ start_waiting_for_noteoffs(Romulus* self)
     }
 }
 
+/* Send note-off for all note-on events in the loop */
+static void
+send_all_notes_off(Romulus* self, uint32_t out_capacity)
+{
+    /* Iterate through all recorded events and send note-offs for note-ons */
+    for (uint32_t i = 0; i < self->event_count; ++i) {
+        MidiEvent* event = &self->events[i];
+        uint8_t status = event->msg[0] & 0xF0;
+        
+        /* Check if it's a note-on */
+        if (status == 0x90 && event->msg[2] > 0) {
+            /* Create a note-off message */
+            uint8_t noteoff_msg[3];
+            noteoff_msg[0] = 0x80 | (event->msg[0] & 0x0F); /* Note-off with same channel */
+            noteoff_msg[1] = event->msg[1]; /* Same note */
+            noteoff_msg[2] = 0x40; /* Velocity 64 */
+            
+            /* Calculate padded event size */
+            uint32_t padded_size = lv2_atom_pad_size(sizeof(LV2_Atom_Event) + 3);
+            
+            /* Check if there's enough space */
+            if (self->midi_out->atom.size + padded_size > out_capacity) {
+                break;
+            }
+            
+            /* Get pointer to next event location */
+            LV2_Atom_Event* out_ev = (LV2_Atom_Event*)
+                ((uint8_t*)LV2_ATOM_CONTENTS(LV2_Atom_Sequence, self->midi_out) +
+                 self->midi_out->atom.size - sizeof(LV2_Atom_Sequence_Body));
+            
+            /* Write event header */
+            out_ev->time.frames = 0; /* Send immediately */
+            out_ev->body.type = self->urids.midi_MidiEvent;
+            out_ev->body.size = 3;
+            
+            /* Write MIDI data */
+            uint8_t* midi_dest = (uint8_t*)(out_ev + 1);
+            memcpy(midi_dest, noteoff_msg, 3);
+            
+            /* Update sequence size */
+            self->midi_out->atom.size += padded_size;
+        }
+    }
+}
+
 /* Calculate frames per beat */
 static inline double
 frames_per_beat(Romulus* self)
@@ -306,7 +353,13 @@ update_transport(Romulus* self, const LV2_Atom_Object* obj)
     
     if (speed && speed->type == self->urids.atom_Float) {
         float speed_val = ((LV2_Atom_Float*)speed)->body;
+        bool was_rolling = self->transport_rolling;
         self->transport_rolling = (speed_val > 0.0f);
+        
+        /* Detect transport stop */
+        if (was_rolling && !self->transport_rolling) {
+            self->transport_just_stopped = true;
+        }
     }
 }
 
@@ -336,6 +389,12 @@ run(LV2_Handle instance, uint32_t n_samples)
     /* Read control ports */
     float record_enable = *self->record_enable;
     float loop_length_bars = *self->loop_length;
+    
+    /* Send all notes off if transport just stopped */
+    if (self->transport_just_stopped && self->event_count > 0) {
+        send_all_notes_off(self, out_capacity);
+        self->transport_just_stopped = false;
+    }
     
     /* Detect record enable toggle (from 1 to 0) */
     bool arm_recording = false;
@@ -386,6 +445,11 @@ run(LV2_Handle instance, uint32_t n_samples)
     
     /* Handle arming recording */
     if (arm_recording) {
+        /* Send all notes off before arming */
+        if (self->event_count > 0) {
+            send_all_notes_off(self, out_capacity);
+        }
+        
         if (self->state == STATE_RECORDING) {
             /* Discard current recording and rearm */
             clear_events(self);
