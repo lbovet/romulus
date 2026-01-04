@@ -97,11 +97,11 @@ typedef struct {
     double sample_rate;
     double bpm;
     double beats_per_bar;
-    double current_bar;
-    double current_beat;
-    double prev_beat;
+    int64_t transport_frame;      /* Current frame position from host */
+    int64_t bar_start_frame;      /* Frame position of the most recent bar start */
     bool transport_rolling;
     bool transport_just_stopped;
+    uint32_t transport_update_count;
     
     /* Loop info */
     uint32_t loop_start_frame;  /* Absolute frame when loop recording started */
@@ -168,10 +168,11 @@ instantiate(const LV2_Descriptor* descriptor,
     self->prev_record_enable = 0.0f;
     self->bpm = 120.0;
     self->beats_per_bar = 4.0;
-    self->current_beat = 0.0;
-    self->prev_beat = 0.0;
+    self->transport_frame = 0;
+    self->bar_start_frame = 0;
     self->transport_rolling = false;
     self->transport_just_stopped = false;
+    self->transport_update_count = 0;
     self->event_count = 0;
     
     /* Initialize active notes */
@@ -341,15 +342,20 @@ frames_per_beat(Romulus* self)
 
 /* Update transport information from position */
 static void
-update_transport(Romulus* self, const LV2_Atom_Object* obj)
+update_transport(Romulus* self, const LV2_Atom_Object* obj, int64_t frame_offset)
 {
     LV2_Atom* bar = NULL;
     LV2_Atom* barBeat = NULL;
     LV2_Atom* bpm_atom = NULL;
     LV2_Atom* bpb = NULL;
     LV2_Atom* speed = NULL;
+    LV2_Atom* frame_atom = NULL;
+    
+    /* Get frame position */
+    LV2_URID frame_urid = self->map->map(self->map->handle, LV2_TIME__frame);
     
     lv2_atom_object_get(obj,
+                       frame_urid, &frame_atom,
                        self->urids.time_bar, &bar,
                        self->urids.time_barBeat, &barBeat,
                        self->urids.time_beatsPerMinute, &bpm_atom,
@@ -357,13 +363,19 @@ update_transport(Romulus* self, const LV2_Atom_Object* obj)
                        self->urids.time_speed, &speed,
                        NULL);
     
-    if (bar && bar->type == self->urids.atom_Long) {
-        self->current_bar = (double)((LV2_Atom_Long*)bar)->body;
+    /* Update frame position */
+    if (frame_atom && frame_atom->type == self->urids.atom_Long) {
+        self->transport_frame = ((LV2_Atom_Long*)frame_atom)->body + frame_offset;
     }
     
-    if (barBeat && barBeat->type == self->urids.atom_Float) {
-        self->prev_beat = self->current_beat;
-        self->current_beat = (double)((LV2_Atom_Float*)barBeat)->body;
+    /* If we get bar/barBeat, calculate the frame position of the bar start */
+    if (bar && bar->type == self->urids.atom_Long &&
+        barBeat && barBeat->type == self->urids.atom_Float) {
+        
+        double beat_in_bar = (double)((LV2_Atom_Float*)barBeat)->body;
+        double frames_per_beat_val = frames_per_beat(self);
+        int64_t frames_from_bar_start = (int64_t)(beat_in_bar * frames_per_beat_val);
+        self->bar_start_frame = self->transport_frame - frames_from_bar_start;
     }
     
     if (bpm_atom && bpm_atom->type == self->urids.atom_Float) {
@@ -391,24 +403,27 @@ update_transport(Romulus* self, const LV2_Atom_Object* obj)
         
         /* Detect transport start - schedule playing */
         if (!was_rolling && self->transport_rolling) {
+            fprintf(stderr, "Romulus: Transport started -> IDLE\n");
             self->state = STATE_IDLE;
         }
     }
+    
 }
 
-/* Check if we're at the start of a bar */
+/* Check if we're at the start of a bar based on frame position */
 static bool
-is_bar_start(Romulus* self)
+is_bar_start(Romulus* self, int64_t current_frame)
 {
-    /* Detect bar boundary crossing:
-     * - Current beat is close to 0 (within first quarter beat)
-     * - OR we crossed from high to low (wrapped around bar boundary)
-     */
-    bool at_bar_start = self->current_beat < 0.25;
-    bool crossed_boundary = (self->prev_beat > self->beats_per_bar - 0.5) && 
-                           (self->current_beat < 0.5);
+    /* Calculate frames per bar */
+    double frames_per_beat_val = frames_per_beat(self);
+    int64_t frames_per_bar = (int64_t)(frames_per_beat_val * self->beats_per_bar);
     
-    return at_bar_start || crossed_boundary;
+    /* Calculate position within the current bar */
+    int64_t frames_since_bar_start = current_frame - self->bar_start_frame;
+    int64_t position_in_bar = frames_since_bar_start % frames_per_bar;
+    
+    /* We're at bar start if position is within first 256 frames (about 5ms at 48kHz) */
+    return position_in_bar < 256;
 }
 
 /* Run the plugin */
@@ -425,6 +440,9 @@ run(LV2_Handle instance, uint32_t n_samples)
     self->midi_out->atom.size = sizeof(LV2_Atom_Sequence_Body);  
     self->midi_out->body.unit = self->urids.atom_frameTime;
     self->midi_out->body.pad = 0;
+    
+    /* Track frame position at start of buffer */
+    int64_t buffer_start_frame = self->transport_frame;
     
     /* Read control ports */
     float record_enable = *self->record_enable;
@@ -485,7 +503,7 @@ run(LV2_Handle instance, uint32_t n_samples)
                    ev->body.type == self->urids.atom_Object ||
                    ev->body.type == self->urids.atom_Blank) {
             /* Update transport information */
-            update_transport(self, (const LV2_Atom_Object*)&ev->body);
+            update_transport(self, (const LV2_Atom_Object*)&ev->body, ev->time.frames);
         }
     }
     
@@ -514,7 +532,7 @@ run(LV2_Handle instance, uint32_t n_samples)
     /* State machine */
     if (self->state == STATE_IDLE && self->transport_rolling && self->event_count > 0) {
         /* Check if we've reached a bar boundary */
-        if (is_bar_start(self)) {
+        if (is_bar_start(self, buffer_start_frame)) {
             fprintf(stderr, "Romulus: IDLE -> PLAYING at bar start (%u events)\n", 
                    self->event_count);
             self->state = STATE_PLAYING;
@@ -522,7 +540,7 @@ run(LV2_Handle instance, uint32_t n_samples)
         }
     } else if (self->state == STATE_ARMED && self->transport_rolling) {
         /* Check if we've reached a bar boundary */
-        if (is_bar_start(self)) {
+        if (is_bar_start(self, buffer_start_frame)) {
             /* Start recording */
             double fpb = frames_per_beat(self);
             uint32_t loop_frames = (uint32_t)(fpb * self->beats_per_bar * loop_length_bars);
@@ -624,6 +642,9 @@ run(LV2_Handle instance, uint32_t n_samples)
     *self->armed = (self->state == STATE_ARMED) ? 1.0f : 0.0f;
     *self->recording = (self->state == STATE_RECORDING) ? 1.0f : 0.0f;
     *self->recorded = (self->state == STATE_PLAYING) ? 1.0f : 0.0f;
+    
+    /* Update frame position for next cycle */
+    self->transport_frame += n_samples;
 }
 
 /* Deactivate the plugin */
