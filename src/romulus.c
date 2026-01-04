@@ -24,12 +24,13 @@
 typedef enum {
     PORT_MIDI_IN = 0,
     PORT_MIDI_OUT = 1,
-    PORT_RECORD_ENABLE = 2,
-    PORT_LOOP_LENGTH = 3,
-    PORT_PERSIST_LOOP = 4,
-    PORT_ARMED = 5,
-    PORT_RECORDING = 6,
-    PORT_RECORDED = 7,
+    PORT_TIME = 2,
+    PORT_RECORD_ENABLE = 3,
+    PORT_LOOP_LENGTH = 4,
+    PORT_PERSIST_LOOP = 5,
+    PORT_ARMED = 6,
+    PORT_RECORDING = 7,
+    PORT_RECORDED = 8,
 } PortIndex;
 
 /* Plugin state */
@@ -78,6 +79,7 @@ typedef struct {
     /* Ports */
     const LV2_Atom_Sequence* midi_in;
     LV2_Atom_Sequence* midi_out;
+    const LV2_Atom_Sequence* time;
     const float* record_enable;
     const float* loop_length;
     float* armed;
@@ -196,6 +198,9 @@ connect_port(LV2_Handle instance, uint32_t port, void* data)
         break;
     case PORT_MIDI_OUT:
         self->midi_out = (LV2_Atom_Sequence*)data;
+        break;
+    case PORT_TIME:
+        self->time = (const LV2_Atom_Sequence*)data;
         break;
     case PORT_RECORD_ENABLE:
         self->record_enable = (const float*)data;
@@ -461,6 +466,16 @@ run(LV2_Handle instance, uint32_t n_samples)
     }
     self->prev_record_enable = record_enable;
     
+    /* Process time port for transport information */
+    LV2_ATOM_SEQUENCE_FOREACH(self->time, ev) {
+        if (ev->body.type == self->urids.time_Position ||
+            ev->body.type == self->urids.atom_Object ||
+            ev->body.type == self->urids.atom_Blank) {
+            /* Update transport information */
+            update_transport(self, (const LV2_Atom_Object*)&ev->body, ev->time.frames);
+        }
+    }
+    
     /* Process incoming MIDI events */
     LV2_ATOM_SEQUENCE_FOREACH(self->midi_in, ev) {
         if (ev->body.type == self->urids.midi_MidiEvent) {
@@ -499,11 +514,6 @@ run(LV2_Handle instance, uint32_t n_samples)
                     }
                 }
             }
-        } else if (ev->body.type == self->urids.time_Position ||
-                   ev->body.type == self->urids.atom_Object ||
-                   ev->body.type == self->urids.atom_Blank) {
-            /* Update transport information */
-            update_transport(self, (const LV2_Atom_Object*)&ev->body, ev->time.frames);
         }
     }
     
